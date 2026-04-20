@@ -71,8 +71,10 @@ server <- function(id) {
           arrange(.data$rxnorm_name) %>%
           collect() %>%
           pull(.data$rxnorm_name)
+        # Default to vioxx — the classic AERS-era case study
+        default_drug <- if ("vioxx" %in% drug_choices) "vioxx" else drug_choices[1]
         updateSelectizeInput(session, "drug", choices = drug_choices,
-                             selected = "rofecoxib", server = TRUE)
+                             selected = default_drug, server = TRUE)
       }
       if (file.exists(EVENT_DICT_PATH)) {
         event_choices <- open_dataset(EVENT_DICT_PATH) %>%
