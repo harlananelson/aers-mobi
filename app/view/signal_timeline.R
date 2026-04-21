@@ -80,8 +80,9 @@ ui <- function(id) {
       column(12,
         h4("Signals by drug and event"),
         p(
-          "Every (drug, event) pair flagged by \u22652 of 4 disproportionality ",
-          "methods (GPS/EBGM, PRR, ROR, IC) is listed below. The table is ",
+          "The top 2000 (drug, event) pairs by peak EB05, among those flagged ",
+          "by \u22652 of 4 disproportionality methods (GPS/EBGM, PRR, ROR, IC). ",
+          "The table is ",
           "searchable, sortable, and paginated \u2014 default sort is Peak EB05 ",
           "descending, so the strongest Bayesian signals are at the top. ",
           "Click any row to see the time-course plot and the label cross-check."
@@ -139,6 +140,11 @@ server <- function(id) {
       ds <- signals()
       lbl <- labels()
       req(ds)
+      # Cap to the top 2000 by peak EB05. There are >140k pairs flagged by
+      # >=2 methods; running the per-row label string match over all of
+      # them blocks the page for minutes. The top 2000 covers the entire
+      # clinically interesting range (weakest kept peak_eb05 will be far
+      # below the signal threshold of 2).
       ps <- ds %>%
         filter(.data$n_methods_flagged >= 2) %>%
         group_by(.data$rxnorm_name, .data$outcome_name) %>%
@@ -149,6 +155,7 @@ server <- function(id) {
           .groups = "drop"
         ) %>%
         arrange(desc(.data$peak_eb05)) %>%
+        utils::head(2000) %>%
         collect()
       ps <- ps[!vapply(ps$outcome_name, .event_is_blacklisted, logical(1)), , drop = FALSE]
       if (is.null(lbl)) {
