@@ -297,7 +297,7 @@ EVENT_BLACKLIST_PATTERNS <- if (length(.loaded_patt) > 0) .loaded_patt else .FAL
   m_subs <- match_exact(names(substance_to_drugs))
   m_atc <- match_exact(names(atc_to_drugs))
   if (length(m_drugs) > 0 && length(substance_to_drugs) > 0) {
-    drug_to_substance <- setNames(
+    drug_to_substance <- stats::setNames(
       rep(names(substance_to_drugs), lengths(substance_to_drugs)),
       unlist(substance_to_drugs, use.names = FALSE)
     )
