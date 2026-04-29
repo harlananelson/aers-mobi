@@ -10,12 +10,24 @@
 box::use(
   shiny[NS, moduleServer, tagList, plotOutput, renderPlot,
         req, reactive, reactiveVal, tags, div, h4, p, hr, fluidRow, column,
-        uiOutput, renderUI, span, observeEvent, isolate],
+        uiOutput, renderUI, span, observeEvent, isolate,
+        textInput, actionButton, debounce],
   arrow[open_dataset, read_parquet],
-  dplyr[filter, collect, pull, arrange, `%>%`, mutate, case_when,
+  dplyr[filter, collect, pull, arrange, distinct, `%>%`, mutate, case_when,
         group_by, summarise, desc],
   DT[datatable, dataTableOutput, renderDataTable, formatRound, formatStyle, styleEqual],
 )
+
+SPLASH_SIZE <- 2000L
+SEARCH_RESULTS_MAX <- 2000L
+
+# Class-effect filter (Track D3, NOVELTY_FILTER_ROADMAP.md Round 4): when this
+# many or more drugs in the same ATC4 chemical subgroup also flag the same
+# event, treat the pair as a class effect rather than a drug-specific signal.
+# Default DT search filter on Class co-flags is set to (0..N-1) so pairs at
+# or above this threshold are hidden by default but visible when the user
+# clears the column filter.
+CLASS_EFFECT_THRESHOLD <- 3L
 
 SIGNALS_PATH <- "data/signals.parquet"
 LABELS_PATH <- "data/fda_labels.parquet"
@@ -241,6 +253,111 @@ EVENT_BLACKLIST_PATTERNS <- if (length(.loaded_patt) > 0) .loaded_patt else .FAL
   lbl[!is.na(lbl$substance) & lbl$substance == substance, , drop = FALSE]
 }
 
+# Server-side fuzzy match across four vocabularies: drug raw names, event
+# names, DiAna substances, and ATC class names. Each match contributes a
+# set of raw drug names (or events) to the table filter. Includes a
+# brand → substance crosswalk: typing "vioxx" (a raw drug name) implies
+# the substance "rofecoxib", which then expands to every brand resolving
+# to rofecoxib. See faers-mobi for full doc.
+.fuzzy_match_pairs <- function(query, events, drugs,
+                               substance_to_drugs = list(),
+                               atc_to_drugs = list(),
+                               max_dist = 0.2) {
+  empty <- list(events = character(0), drugs = character(0),
+                matched_substances = character(0),
+                matched_atc_classes = character(0),
+                drugs_via_drug = character(0),
+                drugs_via_substance = character(0),
+                drugs_via_atc = character(0))
+  if (is.null(query) || !nzchar(query)) return(empty)
+  q_norm <- .normalize_spelling(tolower(query))
+  # Skip agrep on short queries to suppress edit-distance false positives
+  # ("ozempic" -> "clorazepic acid"); exact substring is precise enough
+  # at short lengths. See faers-mobi for full doc.
+  AGREP_MIN_LEN <- 5L
+  match_fuzzy <- function(names) {
+    if (length(names) == 0) return(character(0))
+    n_norm <- .normalize_spelling(tolower(names))
+    exact <- grepl(q_norm, n_norm, fixed = TRUE)
+    fuzzy <- if (nchar(q_norm) >= AGREP_MIN_LEN) {
+      tryCatch(
+        agrep(q_norm, n_norm, max.distance = max_dist),
+        error = function(e) integer(0)
+      )
+    } else integer(0)
+    unique(names[union(which(exact), fuzzy)])
+  }
+  match_exact <- function(names) {
+    if (length(names) == 0) return(character(0))
+    n_norm <- .normalize_spelling(tolower(names))
+    unique(names[grepl(q_norm, n_norm, fixed = TRUE)])
+  }
+  m_events <- match_fuzzy(events)
+  m_drugs <- match_fuzzy(drugs)
+  m_subs <- match_exact(names(substance_to_drugs))
+  m_atc <- match_exact(names(atc_to_drugs))
+  if (length(m_drugs) > 0 && length(substance_to_drugs) > 0) {
+    drug_to_substance <- setNames(
+      rep(names(substance_to_drugs), lengths(substance_to_drugs)),
+      unlist(substance_to_drugs, use.names = FALSE)
+    )
+    implied_subs <- unique(drug_to_substance[m_drugs])
+    implied_subs <- implied_subs[!is.na(implied_subs)]
+    m_subs <- unique(c(m_subs, implied_subs))
+  }
+  drugs_via_substance <- if (length(m_subs) > 0)
+    unique(unlist(substance_to_drugs[m_subs])) else character(0)
+  drugs_via_atc <- if (length(m_atc) > 0)
+    unique(unlist(atc_to_drugs[m_atc])) else character(0)
+  all_drugs <- unique(c(m_drugs, drugs_via_substance, drugs_via_atc))
+  list(events = m_events,
+       drugs = all_drugs,
+       matched_substances = m_subs,
+       matched_atc_classes = m_atc,
+       drugs_via_drug = m_drugs,
+       drugs_via_substance = drugs_via_substance,
+       drugs_via_atc = drugs_via_atc)
+}
+
+# Per-row label match for a subset of pair_stats. The expensive step in
+# the pipeline; deferred to displayed rows only so the full pair table
+# can be assembled cheaply.
+.enrich_label_match <- function(ps_subset, lbl, mh, diana) {
+  if (nrow(ps_subset) == 0) {
+    ps_subset$novel <- logical(0)
+    ps_subset$treats <- logical(0)
+    return(ps_subset)
+  }
+  if (is.null(lbl)) {
+    ps_subset$novel <- NA
+    ps_subset$treats <- NA
+    return(ps_subset)
+  }
+  has_indications <- "indications_and_usage" %in% names(lbl)
+  results <- mapply(function(drug, event) {
+    row <- .find_label_row(lbl, drug, diana)
+    if (nrow(row) == 0 || is.na(row$set_id[1])) return(c(NA, NA))
+    sections <- c(
+      row$boxed_warning[1], row$contraindications[1],
+      row$warnings_and_cautions[1], row$warnings[1], row$adverse_reactions[1]
+    )
+    if (has_indications) sections <- c(sections, row$indications_and_usage[1])
+    sections[is.na(sections)] <- ""
+    combined <- paste(sections, collapse = " \n ")
+    mrow <- if (!is.null(mh)) mh[mh$pt == event, , drop = FALSE] else NULL
+    novel <- !.event_in_label_expanded(event, combined, mrow)
+    treats <- FALSE
+    if (has_indications) {
+      ind <- if (is.na(row$indications_and_usage[1])) "" else row$indications_and_usage[1]
+      treats <- .event_in_label_expanded(event, ind, mrow)
+    }
+    c(novel, treats)
+  }, ps_subset$drug, ps_subset$event)
+  ps_subset$novel <- as.logical(results[1, ])
+  ps_subset$treats <- as.logical(results[2, ])
+  ps_subset
+}
+
 #' @export
 ui <- function(id) {
   ns <- NS(id)
@@ -250,32 +367,52 @@ ui <- function(id) {
         h4("Signals by drug and event"),
         tags$div(class = "alert alert-info small py-2",
           tags$strong("Note:"),
-          " the first load takes 10-20 seconds while the app computes label ",
-          "matches, MedDRA synonyms, and class stats for the top 2000 pairs. ",
-          "Subsequent interactions are fast."),
+          " first load takes a few seconds while the app computes label ",
+          "matches and class stats for the displayed rows. Subsequent ",
+          "interactions are fast. AERS data ends 2012Q3; FAERS continues at ",
+          tags$a(href = "https://faers.mobi", "faers.mobi"), "."),
         p(
-          "The top 2000 (drug, event) pairs by peak EB05, among those flagged ",
-          "by \u22652 of 4 disproportionality methods (GPS/EBGM, PRR, ROR, IC). ",
-          "The table is searchable, sortable, and paginated. Default view: ",
-          tags$strong("Novel"), " pairs with \u22653 quarters of signal, sorted by ",
-          tags$strong("Adj EB05"), " descending (peak EB05 after Weber-effect ",
-          "shrinkage for drugs <5 years on market). Click any row to see the ",
+          "All (drug, event) pairs flagged by \u22652 of 4 disproportionality ",
+          "methods (GPS/EBGM, PRR, ROR, IC) over the AERS 2004\u20132012 era. ",
+          "The splash shows the top ", SPLASH_SIZE, " by ",
+          tags$strong("Adj EB05"), " (peak EB05 after Weber-effect shrinkage ",
+          "for drugs <5 years on market at the time); use search to find any ",
+          "other pair. Default filter: ", tags$strong("Novel"),
+          " pairs with \u22653 quarters of signal. Click any row to see the ",
           "time-course plot and the label cross-check."
         ),
         p(tags$strong("Novel column:"),
-          " \u201Cnovel\u201D means the event is absent from the drug\u2019s boxed ",
-          "warning, contraindications, warnings, adverse reactions, and ",
-          "indications sections \u2014 after MedDRA-synonym expansion (UMLS CUI) ",
-          "and British\u2194American + clinical-term normalization (anaemia/anemia, ",
-          "adrenocortical/adrenal, lymphoblastic/lymphocytic, etc). Medication-",
+          " \u201Cnovel\u201D means the event is absent from the drug\u2019s ",
+          "current FDA label \u2014 boxed warning, contraindications, warnings, ",
+          "adverse reactions, indications \u2014 after MedDRA-synonym expansion ",
+          "(UMLS CUI) and British\u2194American + clinical-term normalization. ",
+          "Note this compares historical AERS-era signals to ",
+          tags$em("current"),
+          " labels: a drug whose label was updated 2013\u20132025 in response to ",
+          "a real signal will show as \u201Cknown\u201D here. Medication-",
           "error, product-quality, and administration PTs are hidden. ",
           tags$strong("Class co-flags"),
-          " = number of other drugs in the same ATC4 class that also flag this ",
-          "event in the top-2000 slice (1 = drug-specific; >1 suggests class ",
-          "effect). These filters substantially reduce false-positive ",
-          "\u201Cnovel\u201D flags, but treat remaining rows as hypotheses to ",
-          "investigate, not confirmed novel associations."),
+          " = number of other drugs in the same ATC4 class that also flag ",
+          "this event across the full pair universe (1 = drug-specific; ",
+          "≥3 suggests class effect). The default view hides pairs ",
+          "with ≥3 class co-flags as likely class effects; clear the ",
+          "Class co-flags column filter to see them. Treat remaining rows ",
+          "as historical hypotheses, not confirmed novel associations."),
         hr()
+      )
+    ),
+    fluidRow(
+      column(8,
+        textInput(ns("search_query"), label = NULL,
+                  placeholder = "Search any brand, generic, substance, ATC class, or event (e.g. vioxx \u2192 rofecoxib brands)\u2026",
+                  width = "100%")
+      ),
+      column(2,
+        actionButton(ns("clear_search"), "Clear", class = "btn-outline-secondary",
+                     style = "width: 100%;")
+      ),
+      column(2,
+        uiOutput(ns("search_status"))
       )
     ),
     fluidRow(
@@ -306,6 +443,58 @@ server <- function(id) {
     signals <- reactive({
       if (!file.exists(SIGNALS_PATH)) return(NULL)
       open_dataset(SIGNALS_PATH)
+    })
+
+    # Distinct drug + event name vectors. Pulled once per session,
+    # filtered to flagged pairs only. Powers the server-side fuzzy
+    # search via .fuzzy_match_pairs() — agrep over these short vectors
+    # is fast, unlike running it across the full pair list.
+    all_events <- reactive({
+      ds <- signals()
+      if (is.null(ds)) return(character(0))
+      ds %>%
+        filter(.data$n_methods_flagged >= 2) %>%
+        distinct(.data$event) %>%
+        collect() %>%
+        pull(.data$event)
+    })
+    all_drugs <- reactive({
+      ds <- signals()
+      if (is.null(ds)) return(character(0))
+      ds %>%
+        filter(.data$n_methods_flagged >= 2) %>%
+        distinct(.data$drug) %>%
+        collect() %>%
+        pull(.data$drug)
+    })
+
+    # Substance -> [raw drug names that resolve via DiAna]; ATC class ->
+    # [raw drug names whose substance maps to the class]. See faers-mobi.
+    substance_to_drugs <- reactive({
+      drugs <- all_drugs()
+      diana <- diana_dict()
+      if (length(drugs) == 0 || is.null(diana)) return(list())
+      sub <- diana$substance[match(tolower(drugs), diana$drugname)]
+      keep <- !is.na(sub)
+      if (!any(keep)) return(list())
+      split(drugs[keep], sub[keep])
+    })
+    atc_to_drugs <- reactive({
+      drugs <- all_drugs()
+      diana <- diana_dict()
+      atc <- atc_classes()
+      if (length(drugs) == 0 || is.null(diana) || is.null(atc)) return(list())
+      sub <- diana$substance[match(tolower(drugs), diana$drugname)]
+      cls <- atc$atc_class4[match(sub, atc$substance)]
+      keep <- !is.na(cls)
+      if (!any(keep)) return(list())
+      split(drugs[keep], cls[keep])
+    })
+
+    search_query <- reactive(input$search_query) %>% debounce(400)
+
+    observeEvent(input$clear_search, {
+      shiny::updateTextInput(session, "search_query", value = "")
     })
 
     # DiAna drug-name dictionary (raw-name -> active substance).
@@ -390,25 +579,23 @@ server <- function(id) {
       lbl
     })
 
-    # One-shot aggregation of every (drug, event) pair flagged by >=2 of 4
-    # methods, with peak EWMA-smoothed EB05 and novelty flag. Used by the
-    # datatable. Computed once per session (reactives cache).
-    pair_stats <- reactive({
+    # The full pair universe: every (drug, event) flagged by >=2 of 4
+    # methods, with cheap enrichment only (substance, first-approval,
+    # Weber, ATC class, class co-flags, triage, watchlist). The expensive
+    # per-row FDA-label match is NOT computed here — it's deferred to
+    # .enrich_label_match() on the subset that's actually rendered. This
+    # lets the full pair table sit in memory cheaply so search can filter
+    # against it without re-running the pipeline.
+    pair_stats_full <- reactive({
       ds <- signals()
-      lbl <- labels()
       req(ds)
-      # Cap to the top 2000 by peak EB05. There are >140k pairs flagged by
-      # >=2 methods; running the per-row label string match over all of
-      # them blocks the page for minutes. The top 2000 covers the entire
-      # clinically interesting range (weakest kept peak_eb05 will be far
-      # below the signal threshold of 2).
-      # Rows in signals where n_methods_flagged >= 2 are all signal-positive
-      # by construction (is_signal_any requires >= 1 method). So the minimum
-      # quarter over the filtered rows is the first quarter this pair was
-      # flagged at the 2+ criterion — a useful "first signal" date.
+      # Aggregate on the arrow side — pushes filter+group_by+summarise
+      # to Arrow, then collects. first_signal = min(quarter) over rows
+      # where the pair was flagged at >=2 methods (is_signal_any holds
+      # by construction when n_methods_flagged >= 1).
       ps <- ds %>%
         filter(.data$n_methods_flagged >= 2) %>%
-        group_by(.data$rxnorm_name, .data$outcome_name) %>%
+        group_by(.data$drug, .data$event) %>%
         summarise(
           peak_eb05 = max(.data$ewma_eb05, na.rm = TRUE),
           n_methods_max = max(.data$n_methods_flagged, na.rm = TRUE),
@@ -418,23 +605,27 @@ server <- function(id) {
           .groups = "drop"
         ) %>%
         arrange(desc(.data$peak_eb05)) %>%
-        utils::head(2000) %>%
         collect()
-      ps <- ps[!vapply(ps$outcome_name, .event_is_blacklisted, logical(1)), , drop = FALSE]
+      # Drop medication-error / admin / product-quality PTs. Test against
+      # the distinct event list rather than the full pair list so the
+      # regex-heavy blacklist check runs once per unique event.
+      uniq_events <- unique(ps$event)
+      bl_flag <- vapply(uniq_events, .event_is_blacklisted, logical(1))
+      ps <- ps[!ps$event %in% uniq_events[bl_flag], , drop = FALSE]
       # Attach DiAna-resolved substance and first-approval date per drug
       diana <- diana_dict()
       appr <- first_approval()
       if (!is.null(diana) && nrow(diana) > 0) {
-        ps$substance <- diana$substance[match(tolower(ps$rxnorm_name), diana$drugname)]
+        ps$substance <- diana$substance[match(tolower(ps$drug), diana$drugname)]
       } else {
         ps$substance <- NA_character_
       }
       if (!is.null(appr) && nrow(appr) > 0) {
-        # Try substance match first, then direct rxnorm_name match as fallback
+        # Try substance match first, then direct drug match as fallback
         ps$first_approval <- appr$first_approval[match(ps$substance, appr$substance)]
         need_fallback <- is.na(ps$first_approval)
         ps$first_approval[need_fallback] <-
-          appr$first_approval[match(tolower(ps$rxnorm_name[need_fallback]),
+          appr$first_approval[match(tolower(ps$drug[need_fallback]),
                                     appr$substance)]
       } else {
         ps$first_approval <- as.Date(NA)
@@ -458,21 +649,21 @@ server <- function(id) {
         ps$atc_class <- NA_character_
       }
       # Class co-flags: for each (class, event), count how many distinct
-      # drugs in the same ATC4 class also flag this event (among top-2000).
-      # A high number means "class effect" (likely already labeled at the
-      # class level even if missing from a specific drug's text);
-      # 1 means drug-specific.
-      has_class <- !is.na(ps$atc_class) & !is.na(ps$outcome_name)
+      # drugs in the same ATC4 class also flag this event across the full
+      # pair universe. A high number means "class effect" (likely already
+      # labeled at the class level even if missing from a specific drug's
+      # text); 1 means drug-specific.
+      has_class <- !is.na(ps$atc_class) & !is.na(ps$event)
       ps$class_co_flags <- 1L
       if (any(has_class)) {
-        key <- paste(ps$atc_class, ps$outcome_name, sep = "\x1f")
+        key <- paste(ps$atc_class, ps$event, sep = "\x1f")
         counts <- table(key[has_class])
         ps$class_co_flags[has_class] <-
           as.integer(counts[match(key[has_class], names(counts))])
       }
       # Join manual-triage classifications. Match on lowercased drug+event.
       tri <- triage()
-      key <- paste(tolower(ps$rxnorm_name), tolower(ps$outcome_name),
+      key <- paste(tolower(ps$drug), tolower(ps$event),
                    sep = "\x1f")
       if (!is.null(tri)) {
         tri_key <- paste(tri$drug_lc, tri$event_lc, sep = "\x1f")
@@ -490,44 +681,97 @@ server <- function(id) {
       } else {
         ps$watch <- ""
       }
-      if (is.null(lbl)) {
-        ps$novel <- NA
-        ps$treats <- NA
-      } else {
-        has_indications <- "indications_and_usage" %in% names(lbl)
-        mh <- meddra()
-        results <- mapply(function(drug, event) {
-          row <- .find_label_row(lbl, drug, diana)
-          if (nrow(row) == 0 || is.na(row$set_id[1])) return(c(NA, NA))
-          sections <- c(
-            row$boxed_warning[1], row$contraindications[1],
-            row$warnings_and_cautions[1], row$warnings[1], row$adverse_reactions[1]
-          )
-          if (has_indications) sections <- c(sections, row$indications_and_usage[1])
-          sections[is.na(sections)] <- ""
-          combined <- paste(sections, collapse = " \n ")
-          mrow <- if (!is.null(mh)) mh[mh$pt == event, , drop = FALSE] else NULL
-          novel <- !.event_in_label_expanded(event, combined, mrow)
-          # "treats" flag: is the event mentioned in the indication
-          # section specifically? If yes the drug is used TO TREAT this
-          # condition, so the signal is likely indication confounding.
-          treats <- FALSE
-          if (has_indications) {
-            ind <- if (is.na(row$indications_and_usage[1])) "" else row$indications_and_usage[1]
-            treats <- .event_in_label_expanded(event, ind, mrow)
-          }
-          c(novel, treats)
-        }, ps$rxnorm_name, ps$outcome_name)
-        ps$novel <- as.logical(results[1, ])
-        ps$treats <- as.logical(results[2, ])
-      }
       ps
+    })
+
+    # The rows actually rendered in the DT, with the expensive per-row
+    # FDA-label match applied. Two paths:
+    #   - Empty search: top SPLASH_SIZE pairs by Adj EB05 (the splash).
+    #   - Non-empty search: pairs whose drug or event matches the query
+    #     (server-side agrep + spelling normalization), capped at
+    #     SEARCH_RESULTS_MAX, sorted by Adj EB05.
+    # The label match runs only on the rendered subset.
+    search_match <- reactive({
+      q <- search_query()
+      .fuzzy_match_pairs(q, all_events(), all_drugs(),
+                         substance_to_drugs(), atc_to_drugs())
+    })
+
+    pair_stats <- reactive({
+      full <- pair_stats_full()
+      req(full)
+      q <- search_query()
+      if (is.null(q) || !nzchar(q)) {
+        full <- full[order(-full$adj_eb05), , drop = FALSE]
+        subset <- utils::head(full, SPLASH_SIZE)
+      } else {
+        m <- search_match()
+        keep <- (full$event %in% m$events) |
+                (full$drug  %in% m$drugs)
+        matched <- full[keep, , drop = FALSE]
+        matched <- matched[order(-matched$adj_eb05), , drop = FALSE]
+        subset <- utils::head(matched, SEARCH_RESULTS_MAX)
+      }
+      .enrich_label_match(subset, labels(), meddra(), diana_dict())
+    })
+
+    # Status line: splash size when no query; categorized match breakdown
+    # across drug name, DiAna substance, ATC4 class, event when querying.
+    output$search_status <- renderUI({
+      q <- search_query()
+      full <- pair_stats_full()
+      req(full)
+      if (is.null(q) || !nzchar(q)) {
+        n_full <- nrow(full)
+        return(tags$small(class = "text-muted",
+                          sprintf("Showing top %s of %s flagged pairs",
+                                  format(min(SPLASH_SIZE, n_full), big.mark = ","),
+                                  format(n_full, big.mark = ","))))
+      }
+      m <- search_match()
+      keep <- (full$event %in% m$events) | (full$drug %in% m$drugs)
+      n_match <- sum(keep)
+      if (n_match == 0) {
+        return(tags$small(class = "text-warning",
+                          sprintf("No pairs match “%s”", q)))
+      }
+      bits <- character(0)
+      if (length(m$drugs_via_drug) > 0) {
+        bits <- c(bits, sprintf("%d drug name%s",
+                                length(m$drugs_via_drug),
+                                if (length(m$drugs_via_drug) == 1) "" else "s"))
+      }
+      if (length(m$matched_substances) > 0) {
+        bits <- c(bits, sprintf("%d substance%s (%d drugs)",
+                                length(m$matched_substances),
+                                if (length(m$matched_substances) == 1) "" else "s",
+                                length(m$drugs_via_substance)))
+      }
+      if (length(m$matched_atc_classes) > 0) {
+        bits <- c(bits, sprintf("%d ATC class%s (%d drugs)",
+                                length(m$matched_atc_classes),
+                                if (length(m$matched_atc_classes) == 1) "" else "es",
+                                length(m$drugs_via_atc)))
+      }
+      if (length(m$events) > 0) {
+        bits <- c(bits, sprintf("%d event%s",
+                                length(m$events),
+                                if (length(m$events) == 1) "" else "s"))
+      }
+      breakdown <- if (length(bits) > 0) paste0(" — matched ", paste(bits, collapse = ", ")) else ""
+      cap <- if (n_match > SEARCH_RESULTS_MAX)
+        sprintf(" (showing top %d)", SEARCH_RESULTS_MAX) else ""
+      tags$small(class = "text-muted",
+                 sprintf("%s pair%s for “%s”%s%s",
+                         format(n_match, big.mark = ","),
+                         if (n_match == 1) "" else "s",
+                         q, breakdown, cap))
     })
 
     # Default row: vioxx + Myocardial infarction (classic AERS-era case).
     .default_row <- function(ps) {
-      preferred <- which(ps$rxnorm_name == "vioxx" &
-                         ps$outcome_name == "Myocardial infarction")
+      preferred <- which(ps$drug == "vioxx" &
+                         ps$event == "Myocardial infarction")
       if (length(preferred) == 1) return(preferred)
       1L
     }
@@ -539,14 +783,14 @@ server <- function(id) {
       # different strings, else just the raw name. Lets users see both the
       # name they know and the canonical active ingredient.
       drug_col <- ifelse(
-        !is.na(ps$substance) & tolower(ps$rxnorm_name) != ps$substance,
-        paste0(ps$rxnorm_name, " (", ps$substance, ")"),
-        ps$rxnorm_name
+        !is.na(ps$substance) & tolower(ps$drug) != ps$substance,
+        paste0(ps$drug, " (", ps$substance, ")"),
+        ps$drug
       )
       display <- data.frame(
         Watch = ps$watch,
         Drug = drug_col,
-        Event = ps$outcome_name,
+        Event = ps$event,
         `Peak EB05` = round(ps$peak_eb05, 2),
         `Adj EB05` = round(ps$adj_eb05, 2),
         Quarters = as.integer(ps$quarters_flagged),
@@ -585,7 +829,9 @@ server <- function(id) {
           searchCols = list(
             NULL, NULL, NULL, NULL, NULL,
             list(search = "3 ... 9999"),
-            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL,
+            list(search = sprintf("0 ... %d", CLASS_EFFECT_THRESHOLD - 1L)),
+            NULL, NULL,
             list(search = "novel")
           ),
           columnDefs = list(list(className = "dt-right",
@@ -606,7 +852,7 @@ server <- function(id) {
       req(ps)
       i <- input$signal_table_rows_selected
       if (is.null(i) || length(i) == 0) i <- .default_row(ps)
-      list(drug = ps$rxnorm_name[i], event = ps$outcome_name[i])
+      list(drug = ps$drug[i], event = ps$event[i])
     })
 
     selected_ts <- reactive({
@@ -614,8 +860,8 @@ server <- function(id) {
       sp <- selected_pair()
       req(ds, sp$drug, sp$event)
       ds %>%
-        filter(.data$rxnorm_name == sp$drug,
-               .data$outcome_name == sp$event) %>%
+        filter(.data$drug == sp$drug,
+               .data$event == sp$event) %>%
         collect() %>%
         arrange(.data$quarter)
     })
